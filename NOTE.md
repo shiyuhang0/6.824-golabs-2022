@@ -68,14 +68,18 @@ goroutine 其实就是线程（程序计数器+一组寄存器+栈）main 其实
 - Deadlock
 
 网络爬虫 Code
-```
-// DFS
 
-// lock
+DFS:
 
-// 同步实现
+lock:
 
-```
+![img.png](./imag/lock.png)
+
+同步实现:
+
+![img.png](./imag/channel.png)
+
+
 
 # GFS
 
@@ -134,7 +138,7 @@ Write 步骤
 
 0. client 发送写请求，master 基于文件名找到 chunk
 
-1.没有 primary 的场景 - 以下在 master 上进行
+1. 没有 primary 的场景 - 以下在 master 上进行
   - master 找到最新的 chunk 副本：根据 version,master 会忽略比 version 更小的 repl。
   - 从中选择一个 chunk 为 primary ，其他为 secondary
   - 增加版本号
@@ -142,13 +146,211 @@ Write 步骤
   - master 将版本号写入磁盘持久化
 
 （版本号是为了选择最新的副本，过期时间是为了防、
-双主- primary 挂了然后重启导致双主，或是网络分区导致了双主）
+双主- primary 挂了然后重启导致双主，或是网络分区导致了双主，等待一个 lease 的时间再去选主，就能保证旧的主过期了）
+
+（当然，还有一些其他防止双主的方法，如一些选举机制-半数以上支持才能当主）
 
 
-2. 然后基于 1PC 进行写入（GFS没有回滚）
+2. 然后基于 1PC 进行写入（GFS没有回滚） - 以下在获取到 primary 后，client 请求 primary,primary 的执行过程
   - primary 找到 offset
   - primary  secondary 都在该 offset 写入
   - secondary 成功返回 yes
   - 所有都成功了 primary 给客户端返回 yes，否则 error
   - 注意：如果部分成功，成功的那部分在 GFS 中不会进行回滚。依赖于 client 重试达到一致
 
+
+这种写入方式会带来一些数据在副本上丢失：
+
+![img.png](imag/repl.png)
+
+该图对应操作如下：
+1. client1 成功写入 A
+2. client2 写入 B 时一个副本失败，但 primary 和另一个副本不回回滚
+3. client3 成功写入 C
+4. client2 重试写入 B
+5. client5 写入 D,发生失败且不重试
+
+
+GFS 允许这种数据错误。那么如何实现更强一致性的分布式存储呢？
+- 可以让 primary 做重复检查
+- 使用 2PC
+
+GFS 存在的问题
+- 单一 master : 存储文件对应关系的内存有限，client 压力过大，弱一致性语义不是很多应用都可以使用
+
+# Replication (主从备份)
+
+解决什么问题
+- fail-stop (指那些能使计算机完全停止工作的错误-如断电，断网，关键硬件损坏)
+- 不包括: 软件 bugs (如错误的计算结果)
+
+
+方案
+- 方案1：state transfer （memory）: 主向备发送状态，这里的状态可以表示内存中的数据或是变更数据。
+- 方案2：Replicated state machine (op)：主向备发送外部事件操作，而不发送实际状态。（如：logging channel）
+
+方案2可能不适用于多核服务器，因为指令顺序可能就不同，并发下就可能导致不同的结果。
+
+如何设计 Replicated state machine ，需要考虑如下问题
+- 复制哪些状态
+- 主备需要保持多紧密的同步
+- 如何切换
+- 如何处理异常
+- replica down 时如何生成新的
+
+复制哪些状态：
+- 多数场景：应用层的状态即可，如 GFS 只需复制 chunk 信息
+- 少数场景：复制机器层面的状态：如内存，寄存器中的内容（不高效）
+
+可能发生的非确定性事件
+- input: 输入时通过外部数据包，读数据包会发起中断。主备中断的在哪条指令需要保持一致。
+- 特殊指令：如随机数
+- 多核并行（最好不用多核）
+
+log entry
+从主发送到从的状态事件操作被称为 log entry，其格式需要包含。·
+- 指令号
+- 类型（输入/其他指令）
+- 数据
+
+output rule
+- 通过 1 pc, backup ack 后 primary 才能返回给 client 输出（影响性能）
+- 主从切换可能导致多个输出（主从都输出了）client 需要去重逻辑（一种方式是丢弃相同 TCP 序列的包）
+
+主备无法通信，会导致脑裂
+- 需要外部系统来判断（如zk可以加锁，让其只能有一个主）
+
+# Go threads and raft
+
+### Go 同步机制
+
+1. 闭包（环境+匿名函数）:其中对外层函数的调用都是指针传递。 waitgroup ：类似 countdownlatch
+```
+func main() {
+	var a string
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		a = "hello"
+		wg.Done()
+	}()
+	wg.Wait()
+	print(a)
+}
+```
+如果不想指针传递，则可以通过传入参数的方式来实现。
+```
+func main() {
+    var a string
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func(a string) {
+        *a = "hello"
+        wg.Done()
+    }(a)
+    wg.Wait()
+    print(a)
+}
+```
+2. mutex
+> 建议在读写共享变量的同时，加锁。不加锁的话需要去思考 happens-before 原则写出正确的代码，加锁的话可以避免这种麻烦。
+
+错误的方式
+```
+func main() {
+	counter := 0
+	for i := 0; i < 1000; i++ {
+		go func() {
+			counter++
+		}()
+	}
+	time.Sleep(1 * time.Second)
+	print(counter)
+}
+```
+
+利用 mutex 加锁：将某一段变为原子操作
+```
+func main() {
+    var counter int
+    var wg sync.WaitGroup
+    var mutex sync.Mutex
+    wg.Add(1000)
+    for i := 0; i < 1000; i++ {
+        go func() {
+            mutex.Lock()
+            counter++
+            mutex.Unlock()
+            wg.Done()
+        }()
+    }
+    wg.Wait()
+    print(counter)
+}
+```
+
+3. condition variable (条件变量)
+
+> 比如实现半数赞成即成为 leader 的投票
+
+```
+mutex.Lock()
+// do something that might affect the condition
+cond.Broadcast()  // cond.signal() will wake up one thread
+mutex.Unlock()
+
+---
+
+mutex.Lock()
+while condition == false {
+  cond.Wait()
+}
+`// now condition is true, and we have the lock
+mutex.Unlock()
+```
+
+4. channel： 同步机制，如果没有数据则阻塞，如果有数据则取出。channel 有 buffered 和 unbuffered 两种，buffered 可以存储数据，unbuffered 不存储任何数据。
+
+```
+func main() {
+    ch := make(chan int)
+    go func() {
+        time.Sleep(1 * time.Second)
+        <-ch
+    }()
+    start := time.Now()
+    c <- true // it will block until the other goroutine receives the value
+    fmt.Println("send took:", time.Since(start))
+}
+``` 
+
+
+deadlock example （unbuffered channel）
+```
+c := make(chan int)
+c <- 1
+<-c
+```
+
+使用场景
+- 生产者消费者
+- 实现类似 waitgroup 的功能
+
+```
+func main() {
+	done := make(chan bool)
+	for i:=0; i<5; i++ {
+        go func(x int) {
+            sendRPC(x)
+            done <- true
+        }(i)
+    }
+    for i:=0; i<5; i++ {
+        <-done
+    }
+}
+
+func sendRPC(i int) {
+    fmt.Println(i)
+}
+```
