@@ -178,7 +178,7 @@ GFS 允许这种数据错误。那么如何实现更强一致性的分布式存�
 GFS 存在的问题
 - 单一 master : 存储文件对应关系的内存有限，client 压力过大，弱一致性语义不是很多应用都可以使用
 
-# Replication (主从备份)
+# Replication (主从备份-容错)
 
 解决什么问题
 - fail-stop (指那些能使计算机完全停止工作的错误-如断电，断网，关键硬件损坏)
@@ -354,3 +354,57 @@ func sendRPC(i int) {
     fmt.Println(i)
 }
 ```
+
+# RAFT (论文)
+> [Raft](https://raft.github.io/) is a consensus algorithm that is designed to be easy to understand. It’s equivalent to Paxos in fault-tolerance and performance. The difference is that it’s decomposed into relatively independent subproblems, and it cleanly addresses all major pieces needed for practical systems. We hope Raft will make consensus available to a wider audience, and that this wider audience will be able to develop a variety of higher quality consensus-based systems than are available today.
+
+1. 什么是 consensus algorithm
+
+共识是具备容错的分布式系统的一个基础问题。共识算法就是帮助多个节点之间达成一致的决议。共识算法需要在多数节点存活时正常工作
+
+共识算法与 replicated state machines 经常一起出现。replicated state machines 是构建主备的一种方式。每个服务有一个 state machine 与一个 log
+- state machine： 想要构建容错的组件，比如 GFS 的 chunk
+- log: 记录输入命令，一般称为 log entry
+
+2. RAFT 的特点（相比与 PAXOS）
+
+raft 的最主要目标：易于理解与引用
+- 拆分 raft 为多个可单独解决的子问题： leader election, log replication, safety and membership changes
+- 减少需要考虑的状态：使用随机初始化 election timeout 来简化 leader election 算法
+
+3. leader election
+
+使用心跳机制触发选举。
+
+心跳发送
+- leader 以 heartbeat timeout 为间隔发送 Append Entries（可能会带 log entry）
+- 若 leader 宕机。则 follower 会在 election timeout 后仍收不到心跳，此时触发选举
+
+心跳处理
+- 若非 follower 收到来自 leader 的心跳，则比较任期，如果任期不大于，则转为 follower
+- 若follower 收到 Append Entries，则重置 election timeout。若任期小则更改任期
+
+选举的场景
+- follower 增加 term，并切换为 candidate
+- 投自己一票。然后并发发出 Request Vote 到其他节点
+- 等待结果
+  - 若收到大多数节点的投票，则成为 leader
+  - 若收到的结果 term 更高，则切换为 follower
+  - 超过 election timeout 未达到半数票（存在其他 candidate 导致 split vote），则会进行重试
+- candidate 若收到心跳，一旦比自己的 >= 自己的 term ，就认为 leader 合法，自己切换为 follower
+- 投票原则
+  - 每个节点在任期内只能投一票，遵循先来先得原则
+  - follower 只能投给比自己数据新节点：任期小的不投，日志 index 小的不投
+  - 投票后重置 election timeout
+
+随机算法
+- election timeout 会随机化，尽量避免同时选举。并保证如果出现同时选举能快速解决
+
+网络分区场景：
+- 多数选举机制可以防止网络分区的脑裂
+- 如果 leader 被分区了，那么当它重新加入网络时，它会被其他节点认为是过期的 leader，因此会被降级为 follower
+
+
+5. safety
+
+原则：如果一个节点但已经在给定 index 上应用了 log entry,那么任何其他节点都不能覆盖这个 index 为其他 log entty
