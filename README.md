@@ -124,6 +124,7 @@ $ bash test-mr.sh
 ```
 
 # RAFT 2A
+https://pdos.csail.mit.edu/6.824/labs/lab-raft.html
 
 1. 如何触发选举
 
@@ -222,3 +223,40 @@ keypoint
 - 若自己不为 follower : 比较任期大小，若 <= 心跳任期，则自己切换为 follower；否则，返回失败
 - 若自己为 follower: 比较任期大小，若 <= 心跳任期，则心跳成功；否则，返回失败
 - 心跳成功时，重置 election timeout
+
+# RAFT 2B
+
+需要实现以下逻辑：
+
+### Start
+由服务调用 start ,开始 raft。
+在 start 中，如果是 leader 则会接受请求。将请求放入 log 中，返回 log index
+
+### 选举
+选举增加判断： only grant when leader's log is newer
+- 最后一个 log entry term 更大视为更新
+- term 相同，如果 log entry 数量 >= 视为更新
+
+### HeartBeat
+心跳逻辑增加 log 处理:
+- 如果心跳返回失败，且不是因为任期小。则说明是 log 匹配不成功。需要调小 nextIndex 
+- 若超过半数心跳成功，则可以提交 leader log 中的 entry ，修改 leader 的 commitindex (此时可以返回给客户端结果，这步无需 code)
+
+### AppendEntries 处理
+follower 如何处理 AppendEntries 请求是重点
+1. PrevLogIndex 处如果 follower 没有 entry，则直接返回 false （leader 会调小 nextIndex ，即调小 PrevLogIndex）
+2. PrevLogIndex 处如果 term 不匹配 , 则返回 false （可以选择删除自 PrevLogIndex 开始，后面的数据）
+3. 没有返回说明 PrevLogIndex 处匹配了。先删除 PrevLogIndex 后的 entry, 再将 leader 的 entry 放到 PrevLogIndex 后的位置
+4. 修改 commitIndex，修改为 leadercommit 与 自身日志末尾 index 较小的一个
+
+### apply
+apply 每个 10ms 循环一次。将 commit 了的 entry 进行 apply (写入应用服务)
+
+### 加速日志同步
+日志同步指让 follower 日志与 leader 日志同步。
+
+如果每次日志不一致，调小 nextIndex 都只调一位。` leader backs up quickly over incorrect follower logs` 测试会失败。
+
+一个简单的加速方案是：每次调小 nextIndex 到上一个任期的起始位置。raft 需要维护这个 term 到 index 的 map. 
+
+follower 心跳成功时会同步 leader 的 map, 防止leader切换重新计算 map

@@ -355,7 +355,40 @@ func sendRPC(i int) {
 }
 ```
 
-# RAFT (论文)
+# 容错-RAFT (lecture)
+
+背景：
+GFS 只有一个 master, 主备自己无法自动切换。因此我们需要一个服务来决定谁是主，并且要避免脑裂！
+
+### test-and-set 服务 (课程)
+
+是什么：test-and-set 基于锁（CAS） 操作来决定谁是主。当向它发送请求，它会维护一个状态位（0/1）。当请求状态是0时，会修改为1，并返回可以成为主；当状态是1时，返回不能成为主。
+
+存在的问题
+- test-and-set 自身会成为单点故障
+- 如果 test-and-set 也实现容错。那么当产生分区时，就可能脑裂。两个请求主的服务分别只和 test-and-set 的某一个节点通信，且 test-and-set 节点之间也分区了。那么都会认为自己是主。
+
+![img.png](imag/test-and-set.png)
+
+如何解决脑裂(paxos vsr 实现了)
+- 使用少数服从多数解决脑裂：2n+1 的服务器可以承受 n 个服务器故障。
+- 使用 term
+
+
+### Raft 与 replication 服务架构 （课程）
+
+以库的方式内置在 replication 系统中（如 kv 服务），帮助服务管理 replicated state (kv 服务的 hash 表)
+其架构如下：
+1. client 请求 leader 服务
+2. 服务下发到 raft (通过 start 函数)
+3. raft 开始执行：以 log 方式，发送心跳（append entry） raft peer
+4. 得到大多数同意 raft 可以提交到服务其上
+5. 服务响应 client
+6. raft leader 会在下一次心跳中（append entry），告知 commit 信息，follower 就能够进行提交
+
+![img.png](imag/raft.png)
+
+### RAFT 定义与特点 (论文)
 > [Raft](https://raft.github.io/) is a consensus algorithm that is designed to be easy to understand. It’s equivalent to Paxos in fault-tolerance and performance. The difference is that it’s decomposed into relatively independent subproblems, and it cleanly addresses all major pieces needed for practical systems. We hope Raft will make consensus available to a wider audience, and that this wider audience will be able to develop a variety of higher quality consensus-based systems than are available today.
 
 1. 什么是 consensus algorithm
@@ -372,11 +405,13 @@ raft 的最主要目标：易于理解与引用
 - 拆分 raft 为多个可单独解决的子问题： leader election, log replication, safety and membership changes
 - 减少需要考虑的状态：使用随机初始化 election timeout 来简化 leader election 算法
 
-3. leader election
+### RAFT leader election (论文+课程)
+> 使用心跳机制触发选举
 
-使用心跳机制触发选举。
+leader 的一个原则
+- 
 
-心跳发送
+leader 心跳机制
 - leader 以 heartbeat timeout 为间隔发送 Append Entries（可能会带 log entry）
 - 若 leader 宕机。则 follower 会在 election timeout 后仍收不到心跳，此时触发选举
 
@@ -384,27 +419,109 @@ raft 的最主要目标：易于理解与引用
 - 若非 follower 收到来自 leader 的心跳，则比较任期，如果任期不大于，则转为 follower
 - 若follower 收到 Append Entries，则重置 election timeout。若任期小则更改任期
 
-选举的场景
+触发选举
 - follower 增加 term，并切换为 candidate
 - 投自己一票。然后并发发出 Request Vote 到其他节点
 - 等待结果
   - 若收到大多数节点的投票，则成为 leader
   - 若收到的结果 term 更高，则切换为 follower
   - 超过 election timeout 未达到半数票（存在其他 candidate 导致 split vote），则会进行重试
-- candidate 若收到心跳，一旦比自己的 >= 自己的 term ，就认为 leader 合法，自己切换为 follower
-- 投票原则
-  - 每个节点在任期内只能投一票，遵循先来先得原则
-  - follower 只能投给比自己数据新节点：任期小的不投，日志 index 小的不投
-  - 投票后重置 election timeout
+- 选举期间收到心跳：若任期 >= 自己的 ，就认为 leader 合法，自己停止选举，切换为 follower
 
-随机算法
-- election timeout 会随机化，尽量避免同时选举。并保证如果出现同时选举能快速解决
+投票原则
+- 每个节点在任期内只能投一票，遵循先来先得原则
+- 只投给 log 比自己新的：1. 最后一个条目的任期号大于等于自己的节点；或是任期相同且 log index 更大的节点，
+- 投票后重置 election timeout
+
+
+随机算法解决 split vote
+- election timeout 会随机化，尽量避免同时选举。并保证如果出现同时选举能快速解决。
+- election timeout 最佳实践：[心跳时间2倍，3-4倍]
 
 网络分区场景：
 - 多数选举机制可以防止网络分区的脑裂
 - 如果 leader 被分区了，那么当它重新加入网络时，它会被其他节点认为是过期的 leader，因此会被降级为 follower
 
+### Raft 日志恢复机制
 
-5. safety
+日志在故障情况下可能会不一致，leader 会让日志逐渐趋向一致。实现方式如下？
 
-原则：如果一个节点但已经在给定 index 上应用了 log entry,那么任何其他节点都不能覆盖这个 index 为其他 log entty
+假设目前日志如下,index 从 0 开始（数字表示任期），且现在 server3 为leader
+```
+         0 1 2 3
+server1：3
+server2: 3 3 4
+server3: 3 3 5
+```
+
+1. leader 增加 6
+```
+         0 1 2 3
+server1：3
+server2: 3 3 4
+server3: 3 3 5 6
+```
+
+2. leader 发送 appendentry，维护以下信息 nextindex[s2] = 3, nextindex[s1] = 3 （下一个 index），并发送
+  - prevlogindex = 2
+  - prevlogterm=5 
+  - entry[] : 所有在 prevlogindex 后的 enrty
+
+3. s2 收到心跳。检查 prevlogindex 中是否满足 prevlogterm 。这里 4！=5 ，因此会返回 false (同理 s1)
+4. leader 收到 false，会减小index：nextindex[s2] = 2, nextindex[s1] = 2 并发送
+  - prevlogindex = 1
+  - prevlogterm= 3
+
+5. s2 收到心跳，检查 index 1通过，则更新所有 entry
+```
+         0 1 2 3
+server1：3
+server2: 3 3 5 6
+server3: 3 3 5 6
+```
+
+6. s1 则会在下一轮中类似更新
+
+```
+         0 1 2 3
+server1：3 3 5 6
+server2: 3 3 5 6
+server3: 3 3 5 6
+```
+
+这样一个一个回滚的方式适用于大多数场景，但效率较低。可以参考论文 5.3 看如何优化。
+
+
+**日志中的一个原则**：一致的日志若多过半数，就需要被提交。这就要求那些少数的日志不能当选 leader ，这由上文投票原则保证
+
+如下面 s1 不能是 leader,因为8需要被提交
+```
+         0 1 2 3
+server1：5 6 7 
+server2: 5 8
+server3: 5 8
+```
+
+### Raft persist
+
+三个需要持久化的数据：
+- log entry
+- currentTerm
+- votedFor
+
+### Raft 日志压缩 与快照
+
+raft 会要求应用程序在某一个 point 创建 snapshot 并持久化。这样该 point 前的日志可以被删除，节省空间。
+
+
+问题:leader 创建 snapshot 后，之前的日志会被删掉。此时如果某个 follower 非常落后，它就没法同步到删掉部分的日志
+方案： installSnapshotRPC —— 出现这个情况时会通过 installSnapshotRPC 发送快照信息+日志信息。
+
+
+### Raft 正确性
+
+Raft 理论上不能保证已提交的数据一定不会被回滚：
+
+结果符合线性一致性即可认为正确（类似强一致性）
+
+什么是 线性一致性
